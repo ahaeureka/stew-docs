@@ -89,9 +89,68 @@ ai_guard:
 | Token 限制 | `max_input_tokens`, `max_output_tokens`, `max_context_tokens` | 输入/输出/历史上限 |
 | 配额 | `daily_token_quota`, `daily_request_quota`, `minute_request_quota`, `quota_window_secs` | 用户级配额 |
 | 内容审查 | `allow_free_chat`, `allowed_topics`, `deny_keywords` | 话题白名单、关键词黑名单 |
-| 分类器 | `classifier_type`, `llm_endpoint`, `llm_model`, `llm_system_prompt`, `llm_timeout_ms`, `llm_confidence_threshold` | 覆盖全局分类器 |
+| 业务意图 | `business_description`, `valid_intent_examples`, `invalid_intent_examples` | LLM 分类器业务上下文与示例 |
+| 分类器 | `classifier_type`, `llm_endpoint`, `llm_model`, `llm_system_prompt`, `llm_timeout_ms`, `llm_confidence_threshold` | 分类器类型与 LLM 参数（`llm_system_prompt` 为完整自定义 prompt） |
 | 请求体 | `request_body_max_bytes`, `body_map`, `history_policy` | 体积限制、字段映射、截断策略 |
 | 审计 | `enable_audit` | 是否输出审计事件 |
+
+### LLM 意图分类 Prompt 配置
+
+当 `classifier_type = "llm"` 时，分类器通过 LLM 判断用户请求是否符合业务范围。Prompt 构建有两种方式：
+
+**方式一：完整自定义（`llm_system_prompt`）**
+
+由管理员直接提供完整的 system prompt，网关原样传给 LLM：
+
+```json
+{
+  "classifier_type": "llm",
+  "llm_system_prompt": "You are a classifier for a SQL assistant. Respond ONLY with JSON: {\"allowed\": true, \"reason\": \"...\", \"confidence\": 0.0}. Only allow questions about SQL, databases, and data analysis."
+}
+```
+
+**方式二：结构化字段自动构建（推荐）**
+
+当 `llm_system_prompt` 为空时，网关从以下三个字段自动组装 prompt，更易维护：
+
+```json
+{
+  "classifier_type": "llm",
+  "business_description": "A coding assistant that helps users write, debug, and review code.",
+  "valid_intent_examples": [
+    "How do I implement a binary search in Python?",
+    "Fix this Rust lifetime error",
+    "Explain what this regex does"
+  ],
+  "invalid_intent_examples": [
+    "Write me a poem",
+    "What's the capital of France?",
+    "Tell me a joke"
+  ]
+}
+```
+
+网关生成的 system prompt 结构如下：
+
+```
+You are an AI intent classifier. Determine whether the user's message is a valid business request for this service.
+
+Business context: A coding assistant that helps users write, debug, and review code.
+
+Valid request examples:
+- How do I implement a binary search in Python?
+- Fix this Rust lifetime error
+- Explain what this regex does
+
+Off-topic / invalid examples:
+- Write me a poem
+- What's the capital of France?
+- Tell me a joke
+
+Respond ONLY with JSON: {"allowed": true, "reason": "...", "confidence": 0.0}
+```
+
+> 两种方式互斥，`llm_system_prompt` 非空时优先使用，完全忽略 `business_description` 和示例字段。
 
 ---
 
