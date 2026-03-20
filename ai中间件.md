@@ -93,6 +93,52 @@ ai_guard:
 | 分类器 | `classifier_type`, `llm_endpoint`, `llm_model`, `llm_system_prompt`, `llm_timeout_ms`, `llm_confidence_threshold` | 分类器类型与 LLM 参数（`llm_system_prompt` 为完整自定义 prompt） |
 | 请求体 | `request_body_max_bytes`, `body_map`, `history_policy` | 体积限制、字段映射、截断策略 |
 | 审计 | `enable_audit` | 是否输出审计事件 |
+| 接口级覆盖 | `endpoint_overrides` | 按 API 端点独立覆盖上述参数（v2.0） |
+
+### 接口级配置（AiGuardEndpointConfig，v2.0 新增）
+
+同一服务下不同 API 端点的成本模型和意图分类需求可能截然不同。`endpoint_overrides` 允许对每个端点独立覆盖服务级参数。
+
+**配置继承优先级**：
+
+```
+接口级 (endpoint_overrides 匹配项的非零/非空字段)
+  > 服务级 (ServiceAiGuardConfig)
+    > 全局 (AiGuardConfig YAML)
+      > 内置默认值
+```
+
+**端点匹配规则**：精确路径匹配 > 最长前缀匹配。每条 override 通过 `exact_paths` 和 `prefix_paths` 声明匹配范围。
+
+**字段覆盖规则**：
+- 数值字段（`u32`/`f32`）：非零值覆盖，`0` = 继承
+- 字符串字段：非空值覆盖，空 = 继承
+- 列表字段（`Vec<String>`）：非空列表覆盖，空 = 继承
+- 布尔字段（`disabled`/`allow_free_chat`/`enable_audit`）：使用 `optional bool`（Proto3），`None` = 继承，`Some(true/false)` = 覆盖
+
+**配额隔离**：每个端点使用独立的 Redis 计数器键，格式为 `ai:rl:min:{endpoint_id}:{user}:{slot}`，避免不同端点共享配额。
+
+配置示例：
+
+```json
+{
+  "endpoint_overrides": [
+    {
+      "endpoint_id": "chat-completions",
+      "exact_paths": ["/v1/chat/completions"],
+      "mode": "enforce",
+      "minute_request_quota": 5,
+      "daily_token_quota": 50000,
+      "deny_keywords": ["ignore previous instructions"]
+    },
+    {
+      "endpoint_id": "embeddings",
+      "prefix_paths": ["/v1/embeddings"],
+      "disabled": true
+    }
+  ]
+}
+```
 
 ### LLM 意图分类 Prompt 配置
 
@@ -223,7 +269,11 @@ message ChatRequest {
 ```
 入站请求
   |
-1. 路径匹配 -- include_paths 前缀匹配
+1. 路径匹配 -- include_paths 前缀匹配（服务级过滤器）
+  |
+1.5 接口级配置解析 -- endpoint_overrides 精确/前缀匹配
+  |   - disabled=true? -> 跳过 AI Guard
+  |   - 合并接口级覆盖字段到运行时配置
   |
 2. 请求体长度校验 -- > request_body_max_bytes ? -> 400
   |
@@ -237,9 +287,9 @@ message ChatRequest {
   |
 7. 上下文截断 -- history_policy 修剪消息
   |
-8. 配额预检 (Redis) -- 分钟/窗口请求数 + 窗口 token
+8. 配额预检 (Redis) -- 分钟/窗口请求数 + 窗口 token（按 endpoint_id 隔离）
   |
-9. 注入预算头 -- x-ai-estimated-tokens, x-ai-max-tokens
+9. 注入预算头 -- x-ai-estimated-tokens, x-ai-max-tokens, x-ai-guard-endpoint
   |
 10. 放行 -> 下游服务
 ```
@@ -254,6 +304,7 @@ message ChatRequest {
 |----|------|
 | `x-ai-guard-action` | `allow` / `deny` / `truncated` / `observed` |
 | `x-ai-guard-reason` | 拒绝或截断原因 |
+| `x-ai-guard-endpoint` | 匹配的接口级 endpoint_id（未匹配时不存在） |
 | `x-ai-quota-remaining-win-tokens` | 当前窗口剩余 token |
 | `x-ai-quota-remaining-win-requests` | 当前窗口剩余请求次数 |
 | `x-ai-quota-win-reset-secs` | 距窗口重置秒数 |
@@ -304,6 +355,7 @@ message ChatRequest {
   "request_id": "abc-123",
   "user_id": "user_456",
   "service": "your.ai.v1.AiChatService",
+  "endpoint_id": "chat-completions",
   "path": "/api/v1/ai/chat",
   "model": "gpt-4o",
   "estimated_input_tokens": 1024,
@@ -316,6 +368,8 @@ message ChatRequest {
 }
 ```
 
+> `endpoint_id` 字段仅在请求命中了 `endpoint_overrides` 中某条配置时出现。
+
 ---
 
 ## 源码索引
@@ -327,9 +381,9 @@ message ChatRequest {
 | AiTokenEstimator | `src/middleware/ai_token_estimator.rs` | Token 估算（字符/4 近似） |
 | AiClassifier | `src/middleware/ai_classifier.rs` | 规则引擎 + LLM 意图分类 |
 | 全局配置 | `src/core/app_config.rs` | `AiGuardConfig` / `LlmClassifierConfig` |
-| 服务级配置 | `src/core/service_security_config.rs` | `ServiceAiGuardConfig` 运行时结构体 |
+| 服务级配置 | `src/core/service_security_config.rs` | `ServiceAiGuardConfig` / `EndpointAiGuardConfig` 运行时结构体 |
 | Proto 注解 | `proto/stew/api/v1/options.proto` | `AiGuardFieldOptions` 消息 + 扩展 50050 |
-| 服务配置 Proto | `proto/service_discovery.proto` | `ServiceAiGuardConfig` / `AiBodyFieldMap` |
+| 服务配置 Proto | `proto/service_discovery.proto` | `ServiceAiGuardConfig` / `AiGuardEndpointConfig` / `AiBodyFieldMap` |
 | 中间件集成 | `src/app/middleware_configurator.rs` | 中间件链注册 |
 | 代理集成 | `src/core/hybrid_proxy.rs` | Phase 2 body processor 调用点 |
 
